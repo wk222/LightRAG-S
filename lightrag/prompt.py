@@ -13,14 +13,16 @@ PROMPTS["DEFAULT_COMPLETION_DELIMITER"] = "<|COMPLETE|>"
 PROMPTS["DEFAULT_ENTITY_TYPES"] = ["organization", "person", "geo", "event", "category"]
 
 PROMPTS["entity_extraction"] = """---Goal---
-Given a text document that is potentially relevant to this activity and a list of entity types, identify all entities of those types from the text and all relationships among the identified entities.
+Given a text document (potentially composed of multiple blocks, separated by '---块 [chunk_key] 开始---\') that is potentially relevant to this activity and a list of entity types, identify all **unique** entities of those types from the text and all relationships among the identified entities. **Pay close attention to different mentions that refer to the same real-world entity across different text blocks (e.g., "ABC Corp" and "ABC Corporation") and consolidate them under a single, canonical name.**
 Use {language} as output language.
 
 ---Steps---
++0. For each input block, prefix the extraction output with the marker '---块 [chunk_key] 开始---', where [chunk_key] matches the block key in the input, so that the results for each block can be correctly split and associated.
 1. Identify all entities. For each identified entity, extract the following information:
 - entity_name: Name of the entity, use same language as input text. If English, capitalized the name.
 - entity_type: One of the following types: [{entity_types}]
 - entity_description: Comprehensive description of the entity's attributes and activities
+**Important:** If multiple mentions across different blocks refer to the same entity, use the most complete or common name as the canonical `entity_name` and merge their descriptions.
 Format each entity as ("entity"{tuple_delimiter}<entity_name>{tuple_delimiter}<entity_type>{tuple_delimiter}<entity_description>)
 
 2. From the entities identified in step 1, identify all pairs of (source_entity, target_entity) that are *clearly related* to each other.
@@ -32,11 +34,18 @@ For each pair of related entities, extract the following information:
 - relationship_keywords: one or more high-level key words that summarize the overarching nature of the relationship, focusing on concepts or themes rather than specific details
 Format each relationship as ("relationship"{tuple_delimiter}<source_entity>{tuple_delimiter}<target_entity>{tuple_delimiter}<relationship_description>{tuple_delimiter}<relationship_keywords>{tuple_delimiter}<relationship_strength>)
 
+**Cross-Block Relationships Handling:**
+- If you find two entities that are in different blocks but are clearly related, associate this relationship with the block containing the most relevant context about their relationship.
+- If an entity appears in multiple blocks, place relationship information in the block with the most detailed description of that relationship.
+- For each relationship between entities that appear in different blocks, add it ONLY ONCE to the most appropriate block, do not repeat the same relationship in multiple blocks.
+- If there is equal context in multiple blocks, prefer the block where both entities are mentioned together.
+
 3. Identify high-level key words that summarize the main concepts, themes, or topics of the entire text. These should capture the overarching ideas present in the document.
 Format the content-level key words as ("content_keywords"{tuple_delimiter}<high_level_keywords>)
 
 4. Return output in {language} as a single list of all the entities and relationships identified in steps 1 and 2. Use **{record_delimiter}** as the list delimiter.
 
+**Ensure that the final list contains only unique entities after consolidation.**
 5. When finished, output {completion_delimiter}
 
 ######################
@@ -50,8 +59,10 @@ Format the content-level key words as ("content_keywords"{tuple_delimiter}<high_
 Entity_types: [{entity_types}]
 Text:
 {input_text}
++**For each block, prefix the extraction result with '---块 [chunk_key] 开始---', where [chunk_key] matches the block key in the input, to ensure proper splitting.**
 ######################
-Output:"""
+Output:
+"""
 
 PROMPTS["entity_extraction_examples"] = [
     """Example 1:
@@ -169,6 +180,12 @@ For each pair of related entities, extract the following information:
 - relationship_keywords: one or more high-level key words that summarize the overarching nature of the relationship, focusing on concepts or themes rather than specific details
 Format each relationship as ("relationship"{tuple_delimiter}<source_entity>{tuple_delimiter}<target_entity>{tuple_delimiter}<relationship_description>{tuple_delimiter}<relationship_keywords>{tuple_delimiter}<relationship_strength>)
 
+**Cross-Block Relationships Handling:**
+- If you find two entities that are in different blocks but are clearly related, associate this relationship with the block containing the most relevant context about their relationship.
+- If an entity appears in multiple blocks, place relationship information in the block with the most detailed description of that relationship.
+- For each relationship between entities that appear in different blocks, add it ONLY ONCE to the most appropriate block, do not repeat the same relationship in multiple blocks.
+- If there is equal context in multiple blocks, prefer the block where both entities are mentioned together.
+
 3. Identify high-level key words that summarize the main concepts, themes, or topics of the entire text. These should capture the overarching ideas present in the document.
 Format the content-level key words as ("content_keywords"{tuple_delimiter}<high_level_keywords>)
 
@@ -234,9 +251,19 @@ You are a helpful assistant tasked with identifying both high-level and low-leve
 
 Given the query and conversation history, list both high-level and low-level keywords. High-level keywords focus on overarching concepts or themes, while low-level keywords focus on specific entities, details, or concrete terms.
 
+---Domain Context---
+Focus domain: {domain}
+When extracting keywords, prioritize concepts, terms, and entities relevant to the {domain} domain when applicable. If the query doesn't relate to this domain, extract general relevant keywords.
+
+---Existing Content Keywords---
+{content_keywords}
+
+When extracting high-level keywords, please consider and incorporate relevant existing content keywords listed above, as they represent important themes from related text blocks.
+
 ---Instructions---
 
 - Consider both the current query and relevant conversation history when extracting keywords
+- If provided, leverage the existing content keywords to enrich your high-level keyword extraction
 - Output the keywords in JSON format, it will be parsed by a JSON parser, do not add any extra content in output
 - The JSON should have two keys:
   - "high_level_keywords" for overarching concepts or themes
