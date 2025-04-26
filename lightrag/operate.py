@@ -486,25 +486,21 @@ async def extract_entities(
     pipeline_status_lock=None,
     llm_response_cache: BaseKVStorage | None = None,
 ) -> None:
-    use_llm_func: callable = global_config["llm_model_func"]
+    use_llm_func = global_config["llm_model_func"]
     entity_extract_max_gleaning = global_config["entity_extract_max_gleaning"]
-
+    # 按顺序收集所有文本块
     ordered_chunks = list(chunks.items())
-    # add language and example number params to prompt
-    language = global_config["addon_params"].get(
-        "language", PROMPTS["DEFAULT_LANGUAGE"]
-    )
-    entity_types = global_config["addon_params"].get(
-        "entity_types", PROMPTS["DEFAULT_ENTITY_TYPES"]
-    )
+    total_chunks = len(ordered_chunks)
+    logger.info(f"[extract_entities] total_chunks={total_chunks}")
+
+    # 构造提示词上下文
+    language = global_config["addon_params"].get("language", PROMPTS["DEFAULT_LANGUAGE"])
+    entity_types = global_config["addon_params"].get("entity_types", PROMPTS["DEFAULT_ENTITY_TYPES"])
     example_number = global_config["addon_params"].get("example_number", None)
     if example_number and example_number < len(PROMPTS["entity_extraction_examples"]):
-        examples = "\n".join(
-            PROMPTS["entity_extraction_examples"][: int(example_number)]
-        )
+        examples = "\n".join(PROMPTS["entity_extraction_examples"][:int(example_number)])
     else:
         examples = "\n".join(PROMPTS["entity_extraction_examples"])
-
     example_context_base = dict(
         tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
         record_delimiter=PROMPTS["DEFAULT_RECORD_DELIMITER"],
@@ -512,9 +508,7 @@ async def extract_entities(
         entity_types=", ".join(entity_types),
         language=language,
     )
-    # add example's format
     examples = examples.format(**example_context_base)
-
     entity_extract_prompt = PROMPTS["entity_extraction"]
     context_base = dict(
         tuple_delimiter=PROMPTS["DEFAULT_TUPLE_DELIMITER"],
@@ -524,286 +518,128 @@ async def extract_entities(
         examples=examples,
         language=language,
     )
-
     continue_prompt = PROMPTS["entity_continue_extraction"].format(**context_base)
     if_loop_prompt = PROMPTS["entity_if_loop_extraction"]
 
-    processed_chunks = 0
-    total_chunks = len(ordered_chunks)
-    total_entities_count = 0
-    total_relations_count = 0
-
-    # Get lock manager from shared storage
-    from .kg.shared_storage import get_graph_db_lock
-
-    graph_db_lock = get_graph_db_lock(enable_logging=False)
-
-    # Use the global use_llm_func_with_cache function from utils.py
-
-    async def _process_extraction_result(
-        result: str, chunk_key: str, file_path: str = "unknown_source"
-    ):
-        """Process a single extraction result (either initial or gleaning)
-        Args:
-            result (str): The extraction result to process
-            chunk_key (str): The chunk key for source tracking
-            file_path (str): The file path for citation
-        Returns:
-            tuple: (nodes_dict, edges_dict) containing the extracted entities and relationships
-        """
+    # 内部函数：处理单块提取结果
+    async def _process_extraction_result(result: str, chunk_key: str, file_path: str = "unknown_source"):
         maybe_nodes = defaultdict(list)
         maybe_edges = defaultdict(list)
-
         records = split_string_by_multi_markers(
             result,
             [context_base["record_delimiter"], context_base["completion_delimiter"]],
         )
-
         for record in records:
-            record = re.search(r"\((.*)\)", record)
-            if record is None:
+            m = re.search(r"\((.*)\)", record)
+            if not m:
                 continue
-            record = record.group(1)
-            record_attributes = split_string_by_multi_markers(
-                record, [context_base["tuple_delimiter"]]
-            )
-
-            if_entities = await _handle_single_entity_extraction(
-                record_attributes, chunk_key, file_path
-            )
-            if if_entities is not None:
-                maybe_nodes[if_entities["entity_name"]].append(if_entities)
+            attrs = split_string_by_multi_markers(m.group(1), [context_base["tuple_delimiter"]])
+            ent = await _handle_single_entity_extraction(attrs, chunk_key, file_path)
+            if ent:
+                maybe_nodes[ent["entity_name"]].append(ent)
                 continue
-
-            if_relation = await _handle_single_relationship_extraction(
-                record_attributes, chunk_key, file_path
-            )
-            if if_relation is not None:
-                maybe_edges[(if_relation["src_id"], if_relation["tgt_id"])].append(
-                    if_relation
-                )
-
+            rel = await _handle_single_relationship_extraction(attrs, chunk_key, file_path)
+            if rel:
+                maybe_edges[(rel["src_id"], rel["tgt_id"])].append(rel)
         return maybe_nodes, maybe_edges
 
-    async def _process_single_content(chunk_key_dp: tuple[str, TextChunkSchema]):
-        """Process a single chunk
-        Args:
-            chunk_key_dp (tuple[str, TextChunkSchema]):
-                ("chunk-xxxxxx", {"tokens": int, "content": str, "full_doc_id": str, "chunk_order_index": int})
-        Returns:
-            tuple: (maybe_nodes, maybe_edges) containing extracted entities and relationships
-        """
-        nonlocal processed_chunks
-        chunk_key = chunk_key_dp[0]
-        chunk_dp = chunk_key_dp[1]
-        content = chunk_dp["content"]
-        # Get file path from chunk data or use default
-        file_path = chunk_dp.get("file_path", "unknown_source")
-
-        # Get initial extraction
-        hint_prompt = entity_extract_prompt.format(
-            **{**context_base, "input_text": content}
-        )
-
-        final_result = await use_llm_func_with_cache(
-            hint_prompt,
+    # 批量调用LLM并收集所有结果
+    all_nodes = defaultdict(list)
+    all_edges = defaultdict(list)
+    batch_size = global_config.get("entity_extract_batch_num", global_config.get("embedding_batch_num", 32))
+    logger.info(f"[extract_entities] batch_size={batch_size}")
+    for batch_start in range(0, total_chunks, batch_size):
+        sub_chunks = ordered_chunks[batch_start: batch_start + batch_size]
+        logger.info(f"[extract_entities] processing batch_start={batch_start}, sub_chunks_count={len(sub_chunks)}")
+        batch_prompt_text = "\n\n".join([f"---块 {k} 开始---\n{v['content']}" for k, v in sub_chunks])
+        batch_hint = entity_extract_prompt.format(**{**context_base, "input_text": batch_prompt_text})
+        batch_result = await use_llm_func_with_cache(
+            batch_hint,
             use_llm_func,
             llm_response_cache=llm_response_cache,
             cache_type="extract",
         )
-        history = pack_user_ass_to_openai_messages(hint_prompt, final_result)
-
-        # Process initial extraction with file path
-        maybe_nodes, maybe_edges = await _process_extraction_result(
-            final_result, chunk_key, file_path
-        )
-
-        # Process additional gleaning results
-        for now_glean_index in range(entity_extract_max_gleaning):
-            glean_result = await use_llm_func_with_cache(
+        # 对整个批次进行多轮 gleaning
+        history = pack_user_ass_to_openai_messages(batch_hint, batch_result)
+        for idx in range(entity_extract_max_gleaning):
+            glean_batch = await use_llm_func_with_cache(
                 continue_prompt,
                 use_llm_func,
                 llm_response_cache=llm_response_cache,
                 history_messages=history,
                 cache_type="extract",
             )
-
-            history += pack_user_ass_to_openai_messages(continue_prompt, glean_result)
-
-            # Process gleaning result separately with file path
-            glean_nodes, glean_edges = await _process_extraction_result(
-                glean_result, chunk_key, file_path
-            )
-
-            # Merge results - only add entities and edges with new names
-            for entity_name, entities in glean_nodes.items():
-                if (
-                    entity_name not in maybe_nodes
-                ):  # Only accetp entities with new name in gleaning stage
-                    maybe_nodes[entity_name].extend(entities)
-            for edge_key, edges in glean_edges.items():
-                if (
-                    edge_key not in maybe_edges
-                ):  # Only accetp edges with new name in gleaning stage
-                    maybe_edges[edge_key].extend(edges)
-
-            if now_glean_index == entity_extract_max_gleaning - 1:
+            history += pack_user_ass_to_openai_messages(continue_prompt, glean_batch)
+            batch_result += glean_batch
+            # 最后一轮直接结束
+            if idx == entity_extract_max_gleaning - 1:
                 break
-
-            if_loop_result: str = await use_llm_func_with_cache(
+            loop_ans = await use_llm_func_with_cache(
                 if_loop_prompt,
                 use_llm_func,
                 llm_response_cache=llm_response_cache,
                 history_messages=history,
                 cache_type="extract",
             )
-            if_loop_result = if_loop_result.strip().strip('"').strip("'").lower()
-            if if_loop_result != "yes":
+            loop_ans = loop_ans.strip().strip('"').strip("'").lower()
+            if loop_ans != "yes":
                 break
+        parts = re.split(r"---块 (.*?) 开始---", batch_result)
+        for i in range(1, len(parts), 2):
+            chunk_key = parts[i].strip()
+            result_text = parts[i + 1]
+            maybe_nodes, maybe_edges = await _process_extraction_result(
+                result_text,
+                chunk_key,
+                chunks[chunk_key].get("file_path", "unknown_source"),
+            )
+            for en, nd in maybe_nodes.items():
+                all_nodes[en].extend(nd)
+            for ek, ed in maybe_edges.items():
+                all_edges[ek].extend(ed)
 
-        processed_chunks += 1
-        entities_count = len(maybe_nodes)
-        relations_count = len(maybe_edges)
-        log_message = f"Chk {processed_chunks}/{total_chunks}: extracted {entities_count} Ent + {relations_count} Rel"
-        logger.info(log_message)
-        if pipeline_status is not None:
-            async with pipeline_status_lock:
-                pipeline_status["latest_message"] = log_message
-                pipeline_status["history_messages"].append(log_message)
-
-        # Return the extracted nodes and edges for centralized processing
-        return maybe_nodes, maybe_edges
-
-    # Get max async tasks limit from global_config
-    llm_model_max_async = global_config.get("llm_model_max_async", 4)
-    semaphore = asyncio.Semaphore(llm_model_max_async)
-
-    async def _process_with_semaphore(chunk):
-        async with semaphore:
-            return await _process_single_content(chunk)
-
-    tasks = []
-    for c in ordered_chunks:
-        task = asyncio.create_task(_process_with_semaphore(c))
-        tasks.append(task)
-
-    # Wait for tasks to complete or for the first exception to occur
-    # This allows us to cancel remaining tasks if any task fails
-    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
-
-    # Check if any task raised an exception
-    for task in done:
-        if task.exception():
-            # If a task failed, cancel all pending tasks
-            # This prevents unnecessary processing since the parent function will abort anyway
-            for pending_task in pending:
-                pending_task.cancel()
-
-            # Wait for cancellation to complete
-            if pending:
-                await asyncio.wait(pending)
-
-            # Re-raise the exception to notify the caller
-            raise task.exception()
-
-    # If all tasks completed successfully, collect results
-    chunk_results = [task.result() for task in tasks]
-
-    # Collect all nodes and edges from all chunks
-    all_nodes = defaultdict(list)
-    all_edges = defaultdict(list)
-
-    for maybe_nodes, maybe_edges in chunk_results:
-        # Collect nodes
-        for entity_name, entities in maybe_nodes.items():
-            all_nodes[entity_name].extend(entities)
-
-        # Collect edges with sorted keys for undirected graph
-        for edge_key, edges in maybe_edges.items():
-            sorted_edge_key = tuple(sorted(edge_key))
-            all_edges[sorted_edge_key].extend(edges)
-
-    # Centralized processing of all nodes and edges
+    # 全局合并并写入图谱和向量存储
     entities_data = []
     relationships_data = []
-
-    # Use graph database lock to ensure atomic merges and updates
+    from .kg.shared_storage import get_graph_db_lock
+    graph_db_lock = get_graph_db_lock(enable_logging=False)
     async with graph_db_lock:
-        # Process and update all entities at once
-        for entity_name, entities in all_nodes.items():
+        for en, nd_list in all_nodes.items():
             entity_data = await _merge_nodes_then_upsert(
-                entity_name,
-                entities,
-                knowledge_graph_inst,
-                global_config,
-                pipeline_status,
-                pipeline_status_lock,
+                en, nd_list,
+                knowledge_graph_inst, global_config,
+                pipeline_status, pipeline_status_lock,
                 llm_response_cache,
             )
             entities_data.append(entity_data)
-
-        # Process and update all relationships at once
-        for edge_key, edges in all_edges.items():
+        for (src, tgt), ed_list in all_edges.items():
             edge_data = await _merge_edges_then_upsert(
-                edge_key[0],
-                edge_key[1],
-                edges,
-                knowledge_graph_inst,
-                global_config,
-                pipeline_status,
-                pipeline_status_lock,
+                src, tgt, ed_list,
+                knowledge_graph_inst, global_config,
+                pipeline_status, pipeline_status_lock,
                 llm_response_cache,
             )
-            if edge_data is not None:
+            if edge_data:
                 relationships_data.append(edge_data)
-
-        # Update total counts
-        total_entities_count = len(entities_data)
-        total_relations_count = len(relationships_data)
-
-        log_message = f"Updating vector storage: {total_entities_count} entities..."
-        logger.info(log_message)
-        if pipeline_status is not None:
-            async with pipeline_status_lock:
-                pipeline_status["latest_message"] = log_message
-                pipeline_status["history_messages"].append(log_message)
-
-        # Update vector databases with all collected data
-        if entity_vdb is not None and entities_data:
-            data_for_vdb = {
-                compute_mdhash_id(dp["entity_name"], prefix="ent-"): {
-                    "entity_name": dp["entity_name"],
-                    "entity_type": dp["entity_type"],
-                    "content": f"{dp['entity_name']}\n{dp['description']}",
-                    "source_id": dp["source_id"],
-                    "file_path": dp.get("file_path", "unknown_source"),
-                }
-                for dp in entities_data
-            }
-            await entity_vdb.upsert(data_for_vdb)
-
-        log_message = (
-            f"Updating vector storage: {total_relations_count} relationships..."
-        )
-        logger.info(log_message)
-        if pipeline_status is not None:
-            async with pipeline_status_lock:
-                pipeline_status["latest_message"] = log_message
-                pipeline_status["history_messages"].append(log_message)
-
-        if relationships_vdb is not None and relationships_data:
-            data_for_vdb = {
-                compute_mdhash_id(dp["src_id"] + dp["tgt_id"], prefix="rel-"): {
-                    "src_id": dp["src_id"],
-                    "tgt_id": dp["tgt_id"],
-                    "keywords": dp["keywords"],
-                    "content": f"{dp['src_id']}\t{dp['tgt_id']}\n{dp['keywords']}\n{dp['description']}",
-                    "source_id": dp["source_id"],
-                    "file_path": dp.get("file_path", "unknown_source"),
-                }
-                for dp in relationships_data
-            }
-            await relationships_vdb.upsert(data_for_vdb)
+    if entity_vdb and entities_data:
+        to_vdb = {compute_mdhash_id(dp["entity_name"], prefix="ent-"): {
+                "entity_name": dp["entity_name"],
+                "entity_type": dp.get("entity_type", "UNKNOWN"),
+                "content": f"{dp['entity_name']}\n{dp['description']}",
+                "source_id": dp["source_id"],
+                "file_path": dp.get("file_path", "unknown_source"),
+            } for dp in entities_data}
+        await entity_vdb.upsert(to_vdb)
+    if relationships_vdb and relationships_data:
+        to_vdb = {compute_mdhash_id(r["src_id"] + r["tgt_id"], prefix="rel-"): {
+                "src_id": r["src_id"],
+                "tgt_id": r["tgt_id"],
+                "content": f"{r['keywords']}\n{r['description']}",
+                "source_id": r["source_id"],
+                "file_path": r.get("file_path", "unknown_source"),
+            } for r in relationships_data}
+        await relationships_vdb.upsert(to_vdb)
+    return
 
 
 async def kg_query(
@@ -981,9 +817,13 @@ async def extract_keywords_only(
     if cached_response is not None:
         try:
             keywords_data = json.loads(cached_response)
-            return keywords_data["high_level_keywords"], keywords_data[
-                "low_level_keywords"
-            ]
+            hl_keywords = keywords_data["high_level_keywords"]
+            ll_keywords = keywords_data["low_level_keywords"]
+            # 添加缓存关键词的日志输出
+            logger.info(f"[关键词查询] 从缓存获取关键词:")
+            logger.info(f"[关键词查询] 高级关键词: {', '.join(hl_keywords)}")
+            logger.info(f"[关键词查询] 低级关键词: {', '.join(ll_keywords)}")
+            return hl_keywords, ll_keywords
         except (json.JSONDecodeError, KeyError):
             logger.warning(
                 "Invalid cache format for keywords, proceeding with extraction"
@@ -1000,6 +840,8 @@ async def extract_keywords_only(
     language = global_config["addon_params"].get(
         "language", PROMPTS["DEFAULT_LANGUAGE"]
     )
+    # 获取domain参数，如果未设置则使用"general"
+    domain = global_config["addon_params"].get("domain", "general")
 
     # 3. Process conversation history
     history_context = ""
@@ -1007,23 +849,40 @@ async def extract_keywords_only(
         history_context = get_conversation_turns(
             param.conversation_history, param.history_turns
         )
+        
+    # 4. 获取相关文本块的content_keywords
+    content_keywords = await _get_content_keywords_from_query(
+        text, 
+        param, 
+        global_config
+    )
+    
+    content_keywords_str = ""
+    if content_keywords:
+        content_keywords_str = "已有的文本块关键词总结:\n" + "\n".join(content_keywords)
+        logger.info(f"[关键词查询] 文本块关键词: {', '.join(content_keywords)}")
 
-    # 4. Build the keyword-extraction prompt
+    # 5. Build the keyword-extraction prompt
     kw_prompt = PROMPTS["keywords_extraction"].format(
-        query=text, examples=examples, language=language, history=history_context
+        query=text, 
+        examples=examples, 
+        language=language, 
+        history=history_context,
+        domain=domain,
+        content_keywords=content_keywords_str
     )
 
     tokenizer: Tokenizer = global_config["tokenizer"]
     len_of_prompts = len(tokenizer.encode(kw_prompt))
     logger.debug(f"[kg_query]Prompt Tokens: {len_of_prompts}")
 
-    # 5. Call the LLM for keyword extraction
+    # 6. Call the LLM for keyword extraction
     use_model_func = (
         param.model_func if param.model_func else global_config["llm_model_func"]
     )
     result = await use_model_func(kw_prompt, keyword_extraction=True)
 
-    # 6. Parse out JSON from the LLM response
+    # 7. Parse out JSON from the LLM response
     match = re.search(r"\{.*\}", result, re.DOTALL)
     if not match:
         logger.error("No JSON-like structure found in the LLM respond.")
@@ -1036,8 +895,13 @@ async def extract_keywords_only(
 
     hl_keywords = keywords_data.get("high_level_keywords", [])
     ll_keywords = keywords_data.get("low_level_keywords", [])
+    
+    # 添加关键词日志输出
+    logger.info(f"[关键词查询] 查询: {text}")
+    logger.info(f"[关键词查询] 高级关键词: {', '.join(hl_keywords)}")
+    logger.info(f"[关键词查询] 低级关键词: {', '.join(ll_keywords)}")
 
-    # 7. Cache only the processed keywords with cache type
+    # 8. Cache only the processed keywords with cache type
     if hl_keywords or ll_keywords:
         cache_data = {
             "high_level_keywords": hl_keywords,
@@ -1059,6 +923,65 @@ async def extract_keywords_only(
             )
 
     return hl_keywords, ll_keywords
+
+
+async def _get_content_keywords_from_query(
+    query: str,
+    param: QueryParam,
+    global_config: dict[str, str],
+) -> list[str]:
+    """
+    根据查询获取相关文本块的content_keywords
+    
+    1. 使用向量搜索找到相关的文本块
+    2. 从文本库和实体关系库中提取已有的content_keywords
+    3. 返回合并后的关键词列表
+    """
+    try:
+        # 获取必要的实例
+        chunks_vdb = global_config.get("chunks_vdb")
+        text_chunks_db = global_config.get("text_chunks")
+        entities_vdb = global_config.get("entities_vdb")
+        relationships_vdb = global_config.get("relationships_vdb")
+        
+        if not chunks_vdb or not text_chunks_db:
+            return []
+            
+        # 使用向量搜索找到相关的文本块
+        results = await chunks_vdb.query(
+            query, top_k=min(5, param.top_k), ids=param.ids
+        )
+        
+        if not results:
+            return []
+            
+        # 获取文本块IDs
+        chunk_ids = [r["id"] for r in results]
+        
+        # 从文本块中提取content_keywords (这一步需要实现从存储中获取content_keywords的方法)
+        content_keywords = []
+        
+        # 从实体和关系中提取关键词
+        if entities_vdb:
+            # 获取与这些文本块相关的实体
+            entity_results = await entities_vdb.query(query, top_k=5)
+            for entity in entity_results:
+                if "keywords" in entity and entity["keywords"]:
+                    content_keywords.append(entity["keywords"])
+                    
+        if relationships_vdb:
+            # 获取与这些文本块相关的关系
+            relation_results = await relationships_vdb.query(query, top_k=5)
+            for relation in relation_results:
+                if "keywords" in relation and relation["keywords"]:
+                    content_keywords.append(relation["keywords"])
+                    
+        # 去重并返回
+        return list(set(content_keywords))
+        
+    except Exception as e:
+        logger.error(f"Error getting content_keywords: {e}")
+        return []
 
 
 async def mix_kg_vector_query(
@@ -2072,21 +1995,21 @@ async def naive_query(
             .strip()
         )
 
-    if hashing_kv.global_config.get("enable_llm_cache"):
-        # Save to cache
-        await save_to_cache(
-            hashing_kv,
-            CacheData(
-                args_hash=args_hash,
-                content=response,
-                prompt=query,
-                quantized=quantized,
-                min_val=min_val,
-                max_val=max_val,
-                mode=query_param.mode,
-                cache_type="query",
-            ),
-        )
+        if hashing_kv.global_config.get("enable_llm_cache"):
+            # 7. Save cache - Only cache after collecting complete response
+            await save_to_cache(
+                hashing_kv,
+                CacheData(
+                    args_hash=args_hash,
+                    content=response,
+                    prompt=query,
+                    quantized=quantized,
+                    min_val=min_val,
+                    max_val=max_val,
+                    mode=query_param.mode,
+                    cache_type="query",
+                ),
+            )
 
     return response
 
