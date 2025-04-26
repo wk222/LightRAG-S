@@ -115,8 +115,11 @@ class LightRAG:
     # Entity extraction
     # ---
 
-    entity_extract_max_gleaning: int = field(default=1)
+    entity_extract_max_gleaning: int = field(default=int(os.getenv("ENTITY_EXTRACT_MAX_GLEANING", 1)))
     """Maximum number of entity extraction attempts for ambiguous content."""
+
+    entity_extract_batch_num: int = field(default=int(os.getenv("ENTITY_EXTRACT_BATCH_NUM", 32)))
+    """Batch size for entity extraction (fallback to embedding_batch_num if not set)."""
 
     summary_to_max_tokens: int = field(default=int(os.getenv("MAX_TOKEN_SUMMARY", 500)))
 
@@ -244,7 +247,8 @@ class LightRAG:
 
     addon_params: dict[str, Any] = field(
         default_factory=lambda: {
-            "language": os.getenv("SUMMARY_LANGUAGE", PROMPTS["DEFAULT_LANGUAGE"])
+            "language": os.getenv("SUMMARY_LANGUAGE", PROMPTS["DEFAULT_LANGUAGE"]),
+            "domain": os.getenv("LIGHTRAG_DOMAIN", "general")
         }
     )
 
