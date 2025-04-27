@@ -634,7 +634,8 @@ async def extract_entities(
         to_vdb = {compute_mdhash_id(r["src_id"] + r["tgt_id"], prefix="rel-"): {
                 "src_id": r["src_id"],
                 "tgt_id": r["tgt_id"],
-                "content": f"{r['keywords']}\n{r['description']}",
+                "keywords": r["keywords"],
+                "content": f"{r['src_id']}\t{r['tgt_id']}\n{r['keywords']}\n{r['description']}",
                 "source_id": r["source_id"],
                 "file_path": r.get("file_path", "unknown_source"),
             } for r in relationships_data}
